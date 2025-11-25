@@ -20,7 +20,8 @@ pub struct Cli {
     #[arg(long, default_value = "2")]
     pub spaces: usize,
 
-    #[arg(short = 'm', long, default_value = "true")]
+    /// Move existing audio streams to the newly selected device (default: true)
+    #[arg(short = 'm', long, default_value = "true", action = clap::ArgAction::Set)]
     pub move_streams: bool,
 }
 
@@ -45,6 +46,7 @@ pub enum CliLauncher {
     Rofi,
     Dmenu,
     Fuzzel,
+    Vicinae,
 }
 
 impl From<CliLauncher> for Launcher {
@@ -54,6 +56,7 @@ impl From<CliLauncher> for Launcher {
             CliLauncher::Rofi => Launcher::Rofi,
             CliLauncher::Dmenu => Launcher::Dmenu,
             CliLauncher::Fuzzel => Launcher::Fuzzel,
+            CliLauncher::Vicinae => Launcher::Vicinae,
         }
     }
 }

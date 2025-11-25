@@ -36,14 +36,16 @@ fn run() -> anyhow::Result<()> {
 
     if cli.move_streams {
         println!(
-            "Successfully set default {} to device ID: {} (and moved active streams)",
+            "✓ Successfully set default {} to device ID: {} and moved active streams",
             device_type, device_id
         );
     } else {
         println!(
-            "Successfully set default {} to device ID: {}",
+            "✓ Successfully set default {} to device ID: {}",
             device_type, device_id
         );
+        println!("Note: Existing audio streams will continue on their current device.");
+        println!("      Remove --move-streams=false to also move existing streams.");
     }
 
     Ok(())

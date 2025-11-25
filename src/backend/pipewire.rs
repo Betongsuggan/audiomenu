@@ -24,6 +24,34 @@ impl PipeWireBackend {
         Ok(String::from_utf8(output.stdout)?)
     }
 
+    fn run_pw_metadata(&self, args: &[&str]) -> Result<String> {
+        let output = Command::new("pw-metadata")
+            .args(args)
+            .output()
+            .context("Failed to execute pw-metadata. Is PipeWire installed?")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("pw-metadata failed: {}", stderr);
+        }
+
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn run_pw_cli(&self, args: &[&str]) -> Result<String> {
+        let output = Command::new("pw-cli")
+            .args(args)
+            .output()
+            .context("Failed to execute pw-cli. Is PipeWire installed?")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("pw-cli failed: {}", stderr);
+        }
+
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
     fn parse_devices(&self, output: &str, device_type: DeviceType) -> Result<Vec<AudioDevice>> {
         let section_name = match device_type {
             DeviceType::Sink => "Sinks:",
@@ -64,34 +92,66 @@ impl PipeWireBackend {
         Ok(devices)
     }
 
-    /// Parse a single device line from wpctl status
-    /// Format: " │  *   58. Family 17h/19h/1ah HD Audio Controller Speaker [vol: 0.54]"
-    /// Or:     " │      73. Radeon High Definition Audio Controller [...] [vol: 0.40]"
-    /// Get all active sink-input or source-output stream IDs
+    /// Get the object.serial for a given device ID
+    fn get_device_serial(&self, device_id: u32) -> Result<String> {
+        let output = self.run_pw_cli(&["info", &device_id.to_string()])?;
+
+        for line in output.lines() {
+            if line.contains("object.serial") {
+                // Extract value between quotes: *		object.serial = "2062"
+                if let Some(start) = line.find('"') {
+                    if let Some(end) = line.rfind('"') {
+                        if start < end {
+                            return Ok(line[start + 1..end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("Could not find object.serial for device {}", device_id)
+    }
+
+    /// Get all active stream IDs for the given device type
     fn get_active_streams(&self, device_type: DeviceType) -> Result<Vec<u32>> {
         let output = self.run_wpctl(&["status"])?;
         let mut stream_ids = Vec::new();
+        let mut in_audio_section = false;
         let mut in_streams_section = false;
-        let stream_type_marker = match device_type {
-            DeviceType::Sink => ">",   // Sink inputs show ">"
-            DeviceType::Source => "<", // Source outputs show "<"
-        };
 
         for line in output.lines() {
-            if line.contains("└─ Streams:") {
+            // Look for the Audio section
+            if line.trim() == "Audio" {
+                in_audio_section = true;
+                continue;
+            }
+
+            // Exit Audio section when we hit Video or Settings
+            if in_audio_section && (line.trim() == "Video" || line.trim() == "Settings") {
+                break;
+            }
+
+            // Look for Streams subsection within Audio
+            if in_audio_section && line.contains("└─ Streams:") {
                 in_streams_section = true;
                 continue;
             }
 
-            if in_streams_section && (line.starts_with("Video") || line.starts_with("Settings")) {
-                break;
-            }
+            // Parse stream lines - they're indented and have a number followed by a dot
+            if in_streams_section && in_audio_section {
+                let trimmed = line.trim_start();
 
-            if in_streams_section && line.contains(stream_type_marker) {
-                let trimmed = line.trim();
-                if let Some(dot_pos) = trimmed.find('.') {
-                    if let Ok(id) = trimmed[..dot_pos].trim().parse::<u32>() {
-                        stream_ids.push(id);
+                // Stream lines look like: "        56. Firefox"
+                // They don't have │ or ├ or └ characters
+                if !trimmed.contains("│") && !trimmed.contains("├") && !trimmed.contains("└") {
+                    if let Some(dot_pos) = trimmed.find('.') {
+                        let id_part = &trimmed[..dot_pos].trim();
+                        if let Ok(id) = id_part.parse::<u32>() {
+                            // Verify this is actually a stream by checking device type
+                            if self.is_stream_for_device_type(id, device_type).unwrap_or(false) {
+                                stream_ids.push(id);
+                            }
+                        }
                     }
                 }
             }
@@ -100,15 +160,42 @@ impl PipeWireBackend {
         Ok(stream_ids)
     }
 
-    fn move_stream(&self, stream_id: u32, device_id: u32) -> Result<()> {
-        self.run_wpctl(&["move", &stream_id.to_string(), &device_id.to_string()])
-            .context(format!(
-                "Failed to move stream {} to device {}",
-                stream_id, device_id
-            ))?;
+    /// Check if a stream ID is for the given device type (sink vs source)
+    fn is_stream_for_device_type(&self, stream_id: u32, device_type: DeviceType) -> Result<bool> {
+        let output = self.run_pw_cli(&["info", &stream_id.to_string()])?;
+
+        for line in output.lines() {
+            if line.contains("media.class") {
+                let line_lower = line.to_lowercase();
+                return Ok(match device_type {
+                    DeviceType::Sink => line_lower.contains("output"),
+                    DeviceType::Source => line_lower.contains("input"),
+                });
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Move a stream to a target device using pw-metadata
+    fn move_stream_to_device(&self, stream_id: u32, device_serial: &str) -> Result<()> {
+        self.run_pw_metadata(&[
+            "-n",
+            "default",
+            &stream_id.to_string(),
+            "target.object",
+            device_serial,
+        ])
+        .context(format!(
+            "Failed to move stream {} to device with serial {}",
+            stream_id, device_serial
+        ))?;
         Ok(())
     }
 
+    /// Parse a single device line from wpctl status
+    /// Format: " │  *   58. Family 17h/19h/1ah HD Audio Controller Speaker [vol: 0.54]"
+    /// Or:     " │      73. Radeon High Definition Audio Controller [...] [vol: 0.40]"
     fn parse_device_line(&self, line: &str, device_type: DeviceType) -> Option<AudioDevice> {
         if !line.contains("│") || !line.contains(".") {
             return None;
@@ -173,13 +260,22 @@ impl AudioBackend for PipeWireBackend {
         device_type: DeviceType,
         move_streams: bool,
     ) -> Result<()> {
+        // First set the default device
         self.set_default(device_id)?;
 
+        // If move_streams is requested, move all active streams
         if move_streams {
+            // Get the object.serial for the target device
+            let device_serial = self.get_device_serial(device_id)?;
+
+            // Get all active streams for this device type
             let stream_ids = self.get_active_streams(device_type)?;
+
+            // Move each stream to the new device
             for stream_id in stream_ids {
-                // Ignore errors when moving streams (some streams might not be movable)
-                let _ = self.move_stream(stream_id, device_id);
+                // Ignore errors when moving individual streams
+                // Some streams might not be movable
+                let _ = self.move_stream_to_device(stream_id, &device_serial);
             }
         }
 
