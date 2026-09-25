@@ -1,73 +1,41 @@
 {
   description = "Launcher-driven audio device manager for Linux";
 
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-  };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs { inherit system overlays; };
+  outputs =
+    { self, nixpkgs }:
+    let
+      forAllSystems =
+        f:
+        nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (
+          system: f nixpkgs.legacyPackages.${system}
+        );
+    in
+    {
+      overlays.default = final: _: { audiomenu = final.callPackage ./package.nix { }; };
 
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" ];
-        };
+      packages = forAllSystems (pkgs: {
+        default = pkgs.callPackage ./package.nix { };
+      });
 
-        runtimeDeps = with pkgs; [ pipewire wireplumber ];
+      # The package build runs `cargo test`
+      checks = forAllSystems (pkgs: {
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      });
 
-        buildInputs = with pkgs; [ rustToolchain ] ++ runtimeDeps;
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
 
-        nativeBuildInputs = with pkgs; [ pkg-config makeWrapper ];
-
-      in {
-        packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "audiomenu";
-          version = "0.1.0";
-
-          src = ./.;
-
-          cargoLock = { lockFile = ./Cargo.lock; };
-
-          inherit nativeBuildInputs buildInputs;
-
-          postInstall = ''
-            wrapProgram $out/bin/audiomenu \
-              --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
-          '';
-
-          meta = with pkgs.lib; {
-            description = "Launcher-driven audio device manager for Linux";
-            homepage = "https://github.com/yourusername/audiomenu";
-            license = licenses.gpl3;
-            maintainers = [ ];
-            platforms = platforms.linux;
-          };
-        };
-
-        devShells.default = pkgs.mkShell {
-          buildInputs = buildInputs
-            ++ (with pkgs; [ cargo-watch rust-analyzer ]);
-
-          inherit nativeBuildInputs;
-
-          shellHook = ''
-            echo "audiomenu development environment"
-            echo "cargo build  - Build the project"
-            echo "cargo run    - Run the project"
-            echo "cargo test   - Run tests"
-          '';
-        };
-
-        apps.default = {
-          type = "app";
-          program = "${self.packages.${system}.default}/bin/audiomenu";
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+          packages = with pkgs; [
+            clippy
+            rustfmt
+            rust-analyzer
+            cargo-watch
+          ];
         };
       });
+    };
 }
